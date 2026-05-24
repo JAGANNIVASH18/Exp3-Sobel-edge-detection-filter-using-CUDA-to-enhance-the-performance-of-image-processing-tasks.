@@ -184,6 +184,9 @@ int main() {
     return 0;
 }
 ```
+## ORIGINAL IMAGE:
+
+<img width="275" height="183" alt="image" src="https://github.com/user-attachments/assets/0c7e0e21-78a6-4705-b215-7a0a03777c14" />
 
 
 ## OUTPUT:
