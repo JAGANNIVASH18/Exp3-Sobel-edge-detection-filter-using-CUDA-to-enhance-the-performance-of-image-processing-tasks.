@@ -38,50 +38,52 @@ Discuss the differences in execution time and output quality.
 ## PROGRAM:
 ```PY
 %%writefile sobelEdgeDetectionFilter.cu
-
-#include <opencv2/opencv.hpp>
-#include <cuda_runtime.h>
-#include <device_launch_parameters.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <math.h>
+#include <cuda_runtime.h>
+#include <opencv2/opencv.hpp>
 
 using namespace cv;
 
-__global__ void sobelFilter(unsigned char *srcImage,
-                            unsigned char *dstImage,
-                            unsigned int width,
-                            unsigned int height) {
+__constant__ int Gx[3][3] = {
+    {-1, 0, 1},
+    {-2, 0, 2},
+    {-1, 0, 1}
+};
+
+__constant__ int Gy[3][3] = {
+    {1, 2, 1},
+    {0, 0, 0},
+    {-1, -2, -1}
+};
+
+__global__ void sobelFilter(unsigned char *srcImage, unsigned char *dstImage,
+                            unsigned int width, unsigned int height) {
 
     int x = blockIdx.x * blockDim.x + threadIdx.x;
     int y = blockIdx.y * blockDim.y + threadIdx.y;
 
-    if (x > 0 && x < width - 1 && y > 0 && y < height - 1) {
+    if (x >= 1 && x < width-1 && y >= 1 && y < height-1) {
 
-        int Gx =
-            -1 * srcImage[(y - 1) * width + (x - 1)] +
-             1 * srcImage[(y - 1) * width + (x + 1)] +
+        int Gx[3][3] = {{-1,0,1},{-2,0,2},{-1,0,1}};
+        int Gy[3][3] = {{1,2,1},{0,0,0},{-1,-2,-1}};
 
-            -2 * srcImage[(y) * width + (x - 1)] +
-             2 * srcImage[(y) * width + (x + 1)] +
+        int sumX = 0;
+        int sumY = 0;
 
-            -1 * srcImage[(y + 1) * width + (x - 1)] +
-             1 * srcImage[(y + 1) * width + (x + 1)];
+        for(int i=-1;i<=1;i++){
+            for(int j=-1;j<=1;j++){
+                unsigned char pixel = srcImage[(y+i)*width + (x+j)];
+                sumX += pixel * Gx[i+1][j+1];
+                sumY += pixel * Gy[i+1][j+1];
+            }
+        }
 
-        int Gy =
-            -1 * srcImage[(y - 1) * width + (x - 1)] +
-            -2 * srcImage[(y - 1) * width + (x)] +
-            -1 * srcImage[(y - 1) * width + (x + 1)] +
+        int magnitude = sqrtf(sumX*sumX + sumY*sumY);
+        magnitude = min(max(magnitude,0),255);
 
-             1 * srcImage[(y + 1) * width + (x - 1)] +
-             2 * srcImage[(y + 1) * width + (x)] +
-             1 * srcImage[(y + 1) * width + (x + 1)];
-
-        int magnitude = sqrtf((Gx * Gx) + (Gy * Gy));
-
-        if (magnitude > 255)
-            magnitude = 255;
-
-        dstImage[y * width + x] = magnitude;
+        dstImage[y*width + x] = (unsigned char)magnitude;
     }
 }
 
@@ -93,93 +95,73 @@ void checkCudaErrors(cudaError_t r) {
 }
 
 int main() {
-
-    // Read image in grayscale
-    Mat image = imread("/content/image.jpg", IMREAD_GRAYSCALE);
+    // Read input image
+    Mat image = imread("/content/taj.jpg", IMREAD_COLOR);
 
     if (image.empty()) {
         printf("Error: Image not found.\n");
         return -1;
     }
 
-    int width = image.cols;
-    int height = image.rows;
+    // Convert to grayscale
+    Mat gray_image;
+    cvtColor(image, gray_image, COLOR_BGR2GRAY);
 
+    int width = gray_image.cols;
+    int height = gray_image.rows;
     size_t imageSize = width * height * sizeof(unsigned char);
 
-    // Allocate host memory
-    unsigned char *h_outputImage =
-        (unsigned char *)malloc(imageSize);
+    // Allocate host memory for output image
+    unsigned char *h_outputImage = (unsigned char *)malloc(imageSize);
+    if (h_outputImage == nullptr) {
+        fprintf(stderr, "Failed to allocate host memory\n");
+        return -1;
+    }
 
     // Allocate device memory
     unsigned char *d_inputImage, *d_outputImage;
-
     checkCudaErrors(cudaMalloc(&d_inputImage, imageSize));
     checkCudaErrors(cudaMalloc(&d_outputImage, imageSize));
+    checkCudaErrors(cudaMemcpy(d_inputImage, gray_image.data, imageSize, cudaMemcpyHostToDevice));
 
-    // Copy image to GPU
-    checkCudaErrors(cudaMemcpy(d_inputImage,
-                               image.data,
-                               imageSize,
-                               cudaMemcpyHostToDevice));
-
-    // CUDA timing events
+    // Define CUDA events for timing
     cudaEvent_t start, stop;
-
     cudaEventCreate(&start);
     cudaEventCreate(&stop);
 
-    dim3 blockSize(16, 16);
-    dim3 gridSize(ceil(width / 16.0),
-                  ceil(height / 16.0));
-
-    // Start timer
-    cudaEventRecord(start);
-
     // Launch kernel
-    sobelFilter<<<gridSize, blockSize>>>(
-        d_inputImage,
-        d_outputImage,
-        width,
-        height
-    );
+    dim3 blockSize(16, 16);
+    dim3 gridSize(ceil(width / 16.0), ceil(height / 16.0));
 
-    // Stop timer
+    cudaEventRecord(start);
+    sobelFilter<<<gridSize, blockSize>>>(d_inputImage, d_outputImage, width, height);
     cudaEventRecord(stop);
 
+    // Synchronize events
     cudaEventSynchronize(stop);
 
+    // Calculate elapsed time
     float milliseconds = 0;
+    cudaEventElapsedTime(&milliseconds, start, stop);
 
-    cudaEventElapsedTime(&milliseconds,
-                         start,
-                         stop);
+    // Copy result back to host
+    checkCudaErrors(cudaMemcpy(h_outputImage, d_outputImage, imageSize, cudaMemcpyDeviceToHost));
 
-    // Copy result back
-    checkCudaErrors(cudaMemcpy(h_outputImage,
-                               d_outputImage,
-                               imageSize,
-                               cudaMemcpyDeviceToHost));
-
-    // Save output image
-    Mat outputImage(height,
-                    width,
-                    CV_8UC1,
-                    h_outputImage);
-
+    // Write output image
+    Mat outputImage(height, width, CV_8UC1, h_outputImage);
     imwrite("output_sobel.jpeg", outputImage);
 
-    // Cleanup
+    // Free memory
     free(h_outputImage);
-
     cudaFree(d_inputImage);
     cudaFree(d_outputImage);
 
+    // Destroy CUDA events
     cudaEventDestroy(start);
     cudaEventDestroy(stop);
 
-    printf("Total time taken: %f milliseconds\n",
-           milliseconds);
+    // Print elapsed time
+    printf("Total time taken: %f milliseconds\n", milliseconds);
 
     return 0;
 }
